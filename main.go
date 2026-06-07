@@ -19,7 +19,7 @@ import (
 )
 
 const (
-	profileDirName  = ".meli-reanalise-reclamacao"
+	profileDirName  = ".meli-cancelar-vendas"
 	loginCheckURL   = "https://www.mercadolivre.com.br/vendas/omni/lista"
 	chatPageURL     = "https://www.mercadolivre.com.br/metricas/meu-atendimento/resumo"
 	loginTimeoutMin = 5
@@ -163,6 +163,8 @@ func main() {
 }
 
 // processBatch handles a single batch of up to 50 numbers via the MELI chat.
+// The chat widget is rendered inside an iframe, so all JS queries use a helper
+// function that searches both the main document and any iframes/shadow roots.
 func processBatch(ctx context.Context, numbers []string, isFirstBatch bool) ([]claimResult, error) {
 	// Step 1: Navigate to the chat page
 	fmt.Println("  Navegando para a página de métricas...")
@@ -172,118 +174,186 @@ func processBatch(ctx context.Context, numbers []string, isFirstBatch bool) ([]c
 	); err != nil {
 		return nil, fmt.Errorf("navegar para métricas: %w", err)
 	}
-	time.Sleep(3 * time.Second)
+	time.Sleep(5 * time.Second)
 
 	// Step 2: Open the assistant chat by clicking the floating button
 	fmt.Println("  Abrindo o assistente...")
-
-	// First try clicking the floating action button
-	var chatOpened bool
-	err := chromedp.Run(ctx,
-		chromedp.Evaluate(`
+	for attempt := 0; attempt < 3; attempt++ {
+		chromedp.Run(ctx, chromedp.Evaluate(`
 			(function() {
-				// Try to find and click the assistant button
-				var btn = document.querySelector('button.action-button[data-component="WIDGET"]');
-				if (btn) { btn.click(); return true; }
-				// Try the top nav "Assistente" button
-				btn = document.querySelector('a[href*="assistente"], button[aria-label*="assistente"], button[aria-label*="Assistente"]');
-				if (btn) { btn.click(); return true; }
-				// Try any button with "Assistente" text
-				var buttons = document.querySelectorAll('button');
-				for (var i = 0; i < buttons.length; i++) {
-					if (buttons[i].textContent.includes('Assistente')) {
-						buttons[i].click();
+				var selectors = [
+					'button.action-button[data-component="WIDGET"]',
+					'button[aria-label="Perguntar ao assistente"]',
+					'button[aria-label*="assistente"]',
+					'button[aria-label*="Assistente"]',
+				];
+				for (var s = 0; s < selectors.length; s++) {
+					var btn = document.querySelector(selectors[s]);
+					if (btn) { btn.click(); return true; }
+				}
+				var all = document.querySelectorAll('button, span, a');
+				for (var i = 0; i < all.length; i++) {
+					var text = all[i].textContent.trim();
+					if (text === 'Assistente' || text.includes('Assistente')) {
+						all[i].click();
 						return true;
 					}
 				}
 				return false;
 			})()
-		`, &chatOpened),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("abrir assistente: %w", err)
-	}
+		`, nil))
+		time.Sleep(3 * time.Second)
 
-	if !chatOpened {
-		// Try clicking the header "Assistente" link
+		// Check if chat opened (look for iframe or chat elements)
+		var found bool
 		chromedp.Run(ctx, chromedp.Evaluate(`
 			(function() {
-				var links = document.querySelectorAll('*');
-				for (var i = 0; i < links.length; i++) {
-					if (links[i].textContent.trim() === 'Assistente' || links[i].textContent.trim() === '✦ Assistente') {
-						links[i].click();
-						return true;
-					}
+				// Chat might be in an iframe
+				var iframes = document.querySelectorAll('iframe');
+				for (var i = 0; i < iframes.length; i++) {
+					try {
+						var doc = iframes[i].contentDocument || iframes[i].contentWindow.document;
+						if (doc && doc.querySelector('#chat-input, .chat-messages')) return true;
+					} catch(e) {}
 				}
-				return false;
+				// Or directly in the DOM
+				return document.querySelector('#chat-input, .chat-messages') !== null;
 			})()
-		`, &chatOpened))
-	}
-
-	// Wait for chat to load
-	time.Sleep(3 * time.Second)
-
-	// Step 3: Check if the chat input is available
-	fmt.Println("  Verificando se o chat está aberto...")
-	var chatInputExists bool
-	for attempt := 0; attempt < 10; attempt++ {
-		chromedp.Run(ctx, chromedp.Evaluate(`
-			document.querySelector('#chat-input, textarea[aria-label*="chat"], textarea[placeholder*="assistente"], textarea[placeholder*="Pergunte"]') !== null
-		`, &chatInputExists))
-		if chatInputExists {
+		`, &found))
+		if found {
 			break
+		}
+	}
+
+	// Step 3: Find the chat input - search in main document, iframes, and shadow roots
+	fmt.Println("  Verificando se o chat está aberto...")
+	var chatFound bool
+	var chatLocation string // "main", "iframe", "shadow"
+	for attempt := 0; attempt < 20; attempt++ {
+		chromedp.Run(ctx, chromedp.Evaluate(`
+			(function() {
+				// Check main document
+				if (document.querySelector('#chat-input')) return 'main';
+				// Check iframes
+				var iframes = document.querySelectorAll('iframe');
+				for (var i = 0; i < iframes.length; i++) {
+					try {
+						var doc = iframes[i].contentDocument || iframes[i].contentWindow.document;
+						if (doc && doc.querySelector('#chat-input')) return 'iframe-' + i;
+						// Also check for textarea with placeholder
+						if (doc && doc.querySelector('textarea[placeholder*="Pergunte"]')) return 'iframe-' + i;
+					} catch(e) {
+						// Cross-origin iframe - can't access
+					}
+				}
+				// Check shadow roots
+				var all = document.querySelectorAll('*');
+				for (var i = 0; i < all.length; i++) {
+					if (all[i].shadowRoot) {
+						if (all[i].shadowRoot.querySelector('#chat-input')) return 'shadow';
+						if (all[i].shadowRoot.querySelector('textarea[placeholder*="Pergunte"]')) return 'shadow';
+					}
+				}
+				return '';
+			})()
+		`, &chatLocation))
+
+		if chatLocation != "" {
+			chatFound = true
+			fmt.Printf("  Chat encontrado em: %s\n", chatLocation)
+			break
+		}
+		if attempt%5 == 4 {
+			fmt.Printf("  Tentativa %d - chat ainda não encontrado, tentando abrir novamente...\n", attempt+1)
+			chromedp.Run(ctx, chromedp.Evaluate(`
+				(function() {
+					var all = document.querySelectorAll('button, span, a');
+					for (var i = 0; i < all.length; i++) {
+						if (all[i].textContent.trim().includes('Assistente')) {
+							all[i].click(); return true;
+						}
+					}
+					return false;
+				})()
+			`, nil))
 		}
 		time.Sleep(1 * time.Second)
 	}
 
-	if !chatInputExists {
+	if !chatFound {
 		return nil, fmt.Errorf("chat não abriu - input não encontrado")
 	}
 
-	// Step 4: Start a new chat (click the "new chat" button if available)
+	// Helper JS function that queries inside the correct context (iframe/shadow/main)
+	// We'll inject this as a function in the page
+	queryFnSetup := fmt.Sprintf(`
+		window.__chatCtx = '%s';
+		window.__getChatDoc = function() {
+			if (window.__chatCtx.startsWith('iframe')) {
+				var idx = parseInt(window.__chatCtx.split('-')[1]);
+				var iframe = document.querySelectorAll('iframe')[idx];
+				if (iframe) return iframe.contentDocument || iframe.contentWindow.document;
+			}
+			if (window.__chatCtx === 'shadow') {
+				var all = document.querySelectorAll('*');
+				for (var i = 0; i < all.length; i++) {
+					if (all[i].shadowRoot && all[i].shadowRoot.querySelector('#chat-input'))
+						return all[i].shadowRoot;
+				}
+			}
+			return document;
+		};
+	`, chatLocation)
+	chromedp.Run(ctx, chromedp.Evaluate(queryFnSetup, nil))
+
+	// Step 4: Start a new conversation
 	fmt.Println("  Iniciando nova conversa...")
 	chromedp.Run(ctx, chromedp.Evaluate(`
 		(function() {
-			// Try to find "new chat" button (pencil icon at the top of chat)
-			var btn = document.querySelector('.chat-header button, button[aria-label*="nova"], button[aria-label*="new"]');
-			if (!btn) {
-				// Look for SVG-based new chat button at the top left of chat panel
-				var svgBtns = document.querySelectorAll('button svg, a svg');
-				// The first icon in the chat header is typically "new conversation"
+			var doc = window.__getChatDoc();
+			if (!doc) return false;
+			var btns = doc.querySelectorAll('button');
+			for (var i = 0; i < btns.length; i++) {
+				var label = btns[i].getAttribute('aria-label') || '';
+				if (label.includes('nova') || label.includes('new') || label.includes('Nova conversa')) {
+					btns[i].click();
+					return true;
+				}
 			}
 			return false;
 		})()
 	`, nil))
+	time.Sleep(2 * time.Second)
 
-	// Step 5: Send the prompt message
+	// Step 5: Send the initial prompt
 	prompt := "Remova as reclamações abaixo que estão impactando minha reputação e podem ser excluídas:"
 	fmt.Println("  Enviando prompt...")
-
+	countBeforePrompt := getAssistantMsgCount(ctx)
 	if err := sendChatMessage(ctx, prompt); err != nil {
 		return nil, fmt.Errorf("enviar prompt: %w", err)
 	}
 
-	// Wait for the assistant to respond (it will ask for the IDs)
+	// Wait for assistant response
 	fmt.Println("  Aguardando resposta do assistente...")
-	if err := waitForResponse(ctx, 30*time.Second); err != nil {
-		return nil, fmt.Errorf("aguardar resposta do prompt: %w", err)
+	if err := waitForResponse(ctx, countBeforePrompt, 30*time.Second); err != nil {
+		return nil, fmt.Errorf("aguardar resposta: %w", err)
 	}
 
 	// Step 6: Send the numbers
 	numbersText := strings.Join(numbers, "\n")
 	fmt.Printf("  Enviando %d números...\n", len(numbers))
-
+	countBeforeNumbers := getAssistantMsgCount(ctx)
 	if err := sendChatMessage(ctx, numbersText); err != nil {
 		return nil, fmt.Errorf("enviar números: %w", err)
 	}
 
-	// Step 7: Wait for the response with the analysis
+	// Step 7: Wait for the analysis response
 	fmt.Println("  Aguardando análise do MELI (pode levar até 60 segundos)...")
-	if err := waitForResponse(ctx, 90*time.Second); err != nil {
+	if err := waitForResponse(ctx, countBeforeNumbers, 90*time.Second); err != nil {
 		return nil, fmt.Errorf("aguardar análise: %w", err)
 	}
 
-	// Step 8: Extract the response text
+	// Step 8: Extract the response
 	fmt.Println("  Coletando resposta...")
 	responseText, err := getLastAssistantMessage(ctx)
 	if err != nil {
@@ -291,7 +361,6 @@ func processBatch(ctx context.Context, numbers []string, isFirstBatch bool) ([]c
 	}
 
 	fmt.Printf("  Resposta do MELI:\n")
-	// Print response indented
 	for _, line := range strings.Split(responseText, "\n") {
 		fmt.Printf("    %s\n", line)
 	}
@@ -303,136 +372,146 @@ func processBatch(ctx context.Context, numbers []string, isFirstBatch bool) ([]c
 }
 
 // sendChatMessage types a message into the chat input and sends it.
+// Uses the iframe's own window for React value setters and events.
 func sendChatMessage(ctx context.Context, message string) error {
-	// Focus the chat input
-	if err := chromedp.Run(ctx, chromedp.Evaluate(`
-		(function() {
-			var input = document.querySelector('#chat-input, textarea[aria-label*="chat"], textarea[placeholder*="assistente"], textarea[placeholder*="Pergunte"]');
-			if (input) {
-				input.focus();
-				input.value = '';
-				// Trigger React's onChange
-				var nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set;
-				nativeInputValueSetter.call(input, '');
-				input.dispatchEvent(new Event('input', { bubbles: true }));
-				return true;
-			}
-			return false;
-		})()
-	`, nil)); err != nil {
-		return fmt.Errorf("focar input: %w", err)
-	}
-
-	time.Sleep(500 * time.Millisecond)
-
-	// Set the message text using React-compatible value setter
+	var result string
 	if err := chromedp.Run(ctx, chromedp.Evaluate(fmt.Sprintf(`
 		(function() {
-			var input = document.querySelector('#chat-input, textarea[aria-label*="chat"], textarea[placeholder*="assistente"], textarea[placeholder*="Pergunte"]');
-			if (input) {
-				input.focus();
-				var nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set;
-				nativeInputValueSetter.call(input, %q);
-				input.dispatchEvent(new Event('input', { bubbles: true }));
-				// Adjust textarea height
-				input.style.height = 'auto';
-				input.style.height = input.scrollHeight + 'px';
-				return true;
+			// Resolve the iframe window and document
+			var iframeWin, iframeDoc;
+			if (window.__chatCtx && window.__chatCtx.startsWith('iframe')) {
+				var idx = parseInt(window.__chatCtx.split('-')[1]);
+				var iframe = document.querySelectorAll('iframe')[idx];
+				if (!iframe) return 'no-iframe';
+				iframeWin = iframe.contentWindow;
+				iframeDoc = iframe.contentDocument || iframeWin.document;
+			} else {
+				iframeWin = window;
+				iframeDoc = document;
 			}
-			return false;
+			if (!iframeDoc) return 'no-doc';
+
+			var input = iframeDoc.querySelector('#chat-input') ||
+						iframeDoc.querySelector('textarea[placeholder*="Pergunte"]') ||
+						iframeDoc.querySelector('textarea[aria-label*="chat"]');
+			if (!input) return 'no-input';
+
+			input.focus();
+			// Use the IFRAME's own prototype setter (critical for React)
+			var setter = Object.getOwnPropertyDescriptor(iframeWin.HTMLTextAreaElement.prototype, 'value').set;
+			setter.call(input, %q);
+			// Dispatch events using the iframe's own Event constructor
+			input.dispatchEvent(new iframeWin.Event('input', { bubbles: true }));
+			input.style.height = 'auto';
+			input.style.height = input.scrollHeight + 'px';
+			return 'ok';
 		})()
-	`, message), nil)); err != nil {
+	`, message), &result)); err != nil {
 		return fmt.Errorf("definir texto: %w", err)
+	}
+	if result != "ok" {
+		return fmt.Errorf("falha ao definir texto: %s", result)
 	}
 
 	time.Sleep(500 * time.Millisecond)
 
-	// Click the send button
-	if err := chromedp.Run(ctx, chromedp.Evaluate(`
+	// Send: try clicking send button, then fall back to Enter key
+	chromedp.Run(ctx, chromedp.Evaluate(`
 		(function() {
-			// Look for send button (arrow icon)
-			var btns = document.querySelectorAll('button[type="button"]');
+			var iframeWin, iframeDoc;
+			if (window.__chatCtx && window.__chatCtx.startsWith('iframe')) {
+				var idx = parseInt(window.__chatCtx.split('-')[1]);
+				var iframe = document.querySelectorAll('iframe')[idx];
+				if (!iframe) return 'no-iframe';
+				iframeWin = iframe.contentWindow;
+				iframeDoc = iframe.contentDocument || iframeWin.document;
+			} else {
+				iframeWin = window;
+				iframeDoc = document;
+			}
+			if (!iframeDoc) return 'no-doc';
+
+			// Look for send button
+			var btns = iframeDoc.querySelectorAll('button');
 			for (var i = 0; i < btns.length; i++) {
-				var svg = btns[i].querySelector('svg');
-				if (svg && btns[i].closest('.new-chat-input__actions, .chat-input')) {
-					// Check if it looks like a send button (not upload, camera, or audio)
-					var ariaLabel = btns[i].getAttribute('aria-label') || '';
-					if (ariaLabel.includes('nviar') || ariaLabel.includes('end')) {
-						btns[i].click();
-						return 'sent-aria';
-					}
+				var label = btns[i].getAttribute('aria-label') || '';
+				if (label.includes('nviar') || label.includes('end') || label.includes('Enviar')) {
+					btns[i].click();
+					return 'sent-button';
 				}
 			}
-			// Try finding a submit-like button within the chat input area
-			var sendBtn = document.querySelector('.new-chat-input button[type="submit"], .chat-input button[type="submit"]');
-			if (sendBtn) {
-				sendBtn.click();
-				return 'sent-submit';
-			}
-			// Fallback: simulate Enter key on the input
-			var input = document.querySelector('#chat-input');
+			// Fallback: Enter key on the input
+			var input = iframeDoc.querySelector('#chat-input') || iframeDoc.querySelector('textarea[placeholder*="Pergunte"]');
 			if (input) {
-				input.dispatchEvent(new KeyboardEvent('keydown', {key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true}));
-				input.dispatchEvent(new KeyboardEvent('keypress', {key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true}));
-				input.dispatchEvent(new KeyboardEvent('keyup', {key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true}));
+				input.dispatchEvent(new iframeWin.KeyboardEvent('keydown', {key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true}));
 				return 'sent-enter';
 			}
 			return 'not-found';
 		})()
-	`, nil)); err != nil {
-		return fmt.Errorf("enviar mensagem: %w", err)
-	}
+	`, nil))
 
 	time.Sleep(1 * time.Second)
 	return nil
 }
 
-// waitForResponse waits until the assistant finishes responding (loading indicator disappears).
-func waitForResponse(ctx context.Context, timeout time.Duration) error {
+// getAssistantMsgCount returns the current count of assistant messages in the chat.
+func getAssistantMsgCount(ctx context.Context) int {
+	var count int
+	chromedp.Run(ctx, chromedp.Evaluate(`
+		(function() {
+			var doc = window.__getChatDoc();
+			if (!doc) return 0;
+			return doc.querySelectorAll('.message-item--assistant').length;
+		})()
+	`, &count))
+	return count
+}
+
+// waitForResponse waits until a NEW assistant message appears and stabilizes.
+// initialCount is the number of assistant messages before the user message was sent.
+func waitForResponse(ctx context.Context, initialCount int, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
-	// First wait for loading to start (the dots appear)
 	time.Sleep(2 * time.Second)
 
-	// Then wait for loading to finish
-	for time.Now().Before(deadline) {
-		var isLoading bool
-		chromedp.Run(ctx, chromedp.Evaluate(`
-			(function() {
-				// Check for typing indicator, loading dots, or pending message
-				var loading = document.querySelector('.typing-indicator, .loading-dots, .message-item--loading, .chat-messages__loading');
-				if (loading) return true;
-				// Check if the last message is still being typed (streaming)
-				var msgs = document.querySelectorAll('.message-item--assistant');
-				if (msgs.length > 0) {
-					var last = msgs[msgs.length - 1];
-					// If it has a loading class or the content is empty
-					if (last.querySelector('.typing-indicator, .loading-dots, .message-loading')) return true;
-				}
-				// Check for any animated dots (common loading pattern)
-				var dots = document.querySelectorAll('[class*="loading"], [class*="typing"], [class*="dot-"]');
-				for (var i = 0; i < dots.length; i++) {
-					if (dots[i].closest('.chat-messages, .message-item')) return true;
-				}
-				return false;
-			})()
-		`, &isLoading))
+	prevText := ""
+	stableCount := 0
 
-		if !isLoading {
-			// Double-check: wait a moment and verify it's really done
-			time.Sleep(2 * time.Second)
+	for time.Now().Before(deadline) {
+		currentCount := getAssistantMsgCount(ctx)
+
+		if currentCount > initialCount {
+			// New message appeared — read its text
+			var currentText string
 			chromedp.Run(ctx, chromedp.Evaluate(`
 				(function() {
-					var loading = document.querySelector('.typing-indicator, .loading-dots, .message-item--loading');
-					return loading !== null;
+					var doc = window.__getChatDoc();
+					if (!doc) return '';
+					var msgs = doc.querySelectorAll('.message-item--assistant');
+					if (msgs.length === 0) return '';
+					var last = msgs[msgs.length - 1];
+					var content = last.querySelector('.chat-message__content');
+					return content ? content.textContent.trim() : last.textContent.trim();
 				})()
-			`, &isLoading))
-			if !isLoading {
-				return nil
+			`, &currentText))
+
+			if currentText != "" && currentText == prevText {
+				stableCount++
+				if stableCount >= 3 {
+					return nil // text hasn't changed in ~6s
+				}
+			} else {
+				stableCount = 0
+				prevText = currentText
 			}
 		}
-		time.Sleep(1 * time.Second)
+
+		time.Sleep(2 * time.Second)
 	}
 
+	// If we got some text despite timeout, consider it done
+	if prevText != "" {
+		return nil
+	}
 	return fmt.Errorf("timeout aguardando resposta do assistente")
 }
 
@@ -441,10 +520,11 @@ func getLastAssistantMessage(ctx context.Context) (string, error) {
 	var text string
 	err := chromedp.Run(ctx, chromedp.Evaluate(`
 		(function() {
-			var msgs = document.querySelectorAll('.message-item--assistant');
+			var doc = window.__getChatDoc();
+			if (!doc) return '';
+			var msgs = doc.querySelectorAll('.message-item--assistant');
 			if (msgs.length === 0) return '';
 			var last = msgs[msgs.length - 1];
-			// Get text content, preserving some structure
 			var content = last.querySelector('.chat-message__content');
 			if (content) return content.textContent.trim();
 			return last.textContent.trim();
@@ -459,97 +539,155 @@ func getLastAssistantMessage(ctx context.Context) (string, error) {
 	return text, nil
 }
 
+// categorizeAfterNumber looks at text immediately following a number for per-number format.
+// e.g., "5503663801: sem impacto" → "no_impact"
+func categorizeAfterNumber(textAfter string) string {
+	t := strings.ToLower(strings.TrimSpace(textAfter))
+	// Match patterns like ": sem impacto", ": excluída", ": continua impactando"
+	if strings.HasPrefix(t, ":") || strings.HasPrefix(t, " ") {
+		t = strings.TrimLeft(t, ": ")
+	}
+	if strings.HasPrefix(t, "sem impacto") || strings.HasPrefix(t, "não afeta") ||
+		strings.HasPrefix(t, "não impacta") || strings.HasPrefix(t, "já sem impacto") {
+		return "no_impact"
+	}
+	if strings.HasPrefix(t, "excluíd") || strings.HasPrefix(t, "excluid") ||
+		strings.HasPrefix(t, "xcluíd") || strings.HasPrefix(t, "removid") {
+		return "excluded"
+	}
+	if strings.HasPrefix(t, "continua") || strings.HasPrefix(t, "impactando") ||
+		strings.HasPrefix(t, "não consegu") || strings.HasPrefix(t, "não foi") {
+		return "impacting"
+	}
+	return ""
+}
+
 // parseResponse parses the assistant's response text and categorizes each number.
+// Handles two formats:
+// 1. Per-number: "5503663801: sem impacto" — text after each number indicates its category
+// 2. Section-based: "Sem impacto agora5503663801..." — numbers grouped under section headers
 func parseResponse(response string, originalNumbers []string) []claimResult {
 	responseLower := strings.ToLower(response)
-	results := make([]claimResult, 0, len(originalNumbers))
+	numberCategories := make(map[string]string)
 
-	// Extract numbers from the response that appear in each category
-	excludedNumbers := make(map[string]bool)
-	noImpactNumbers := make(map[string]bool)
-	impactingNumbers := make(map[string]bool)
-
-	// Split response into sections
-	lines := strings.Split(response, "\n")
-
-	currentSection := ""
-	for _, line := range lines {
-		lineLower := strings.ToLower(strings.TrimSpace(line))
-
-		// Detect section headers
-		if strings.Contains(lineLower, "excluíd") || strings.Contains(lineLower, "excluid") ||
-			strings.Contains(lineLower, "removid") {
-			currentSection = "excluded"
-		} else if strings.Contains(lineLower, "sem impacto") || strings.Contains(lineLower, "não afet") ||
-			strings.Contains(lineLower, "não impacta") {
-			currentSection = "no_impact"
-		} else if strings.Contains(lineLower, "continuam impactando") || strings.Contains(lineLower, "seguem impactando") ||
-			strings.Contains(lineLower, "não consegu") || strings.Contains(lineLower, "não foi possível") {
-			currentSection = "impacting"
+	// --- Strategy 1: Per-number format ("number: category") ---
+	for _, num := range originalNumbers {
+		pos := strings.Index(responseLower, num)
+		if pos < 0 {
+			continue
 		}
-
-		// Extract numbers from this line
-		re := regexp.MustCompile(`\d{7,13}`)
-		found := re.FindAllString(line, -1)
-		for _, num := range found {
-			switch currentSection {
-			case "excluded":
-				excludedNumbers[num] = true
-			case "no_impact":
-				noImpactNumbers[num] = true
-			case "impacting":
-				impactingNumbers[num] = true
+		afterPos := pos + len(num)
+		if afterPos < len(responseLower) {
+			// Read up to 60 chars after the number
+			end := afterPos + 60
+			if end > len(responseLower) {
+				end = len(responseLower)
+			}
+			textAfter := responseLower[afterPos:end]
+			cat := categorizeAfterNumber(textAfter)
+			if cat != "" {
+				numberCategories[num] = cat
 			}
 		}
 	}
 
-	// Also try to parse summary line like "Excluídas agora: 2" to validate
-	// But individual number assignment is more important
+	// If per-number found results for most numbers, use that
+	if len(numberCategories) >= len(originalNumbers)/2 && len(numberCategories) > 0 {
+		// per-number format detected
+	} else {
+		// --- Strategy 2: Section-based format ---
+		numberCategories = make(map[string]string) // reset
 
-	// Map results for each original number
-	for _, num := range originalNumbers {
-		category := "Não identificado na resposta"
+		type sectionMarker struct {
+			pos      int
+			category string
+		}
+		var markers []sectionMarker
 
-		if excludedNumbers[num] {
-			category = "Excluída"
-		} else if noImpactNumbers[num] {
-			category = "Sem impacto na reputação"
-		} else if impactingNumbers[num] {
-			category = "Continua impactando"
-		} else {
-			// Try harder: search in full response
-			if strings.Contains(response, num) {
-				// Number is mentioned but not clearly categorized
-				// Use context around it
-				idx := strings.Index(response, num)
-				if idx >= 0 {
-					surroundStart := idx - 200
-					if surroundStart < 0 {
-						surroundStart = 0
-					}
-					surroundEnd := idx + len(num) + 50
-					if surroundEnd > len(response) {
-						surroundEnd = len(response)
-					}
-					surrounding := strings.ToLower(response[surroundStart:surroundEnd])
-					if strings.Contains(surrounding, "excluíd") || strings.Contains(surrounding, "removid") {
-						category = "Excluída"
-					} else if strings.Contains(surrounding, "sem impacto") || strings.Contains(surrounding, "não afet") {
-						category = "Sem impacto na reputação"
-					} else if strings.Contains(surrounding, "impactando") || strings.Contains(surrounding, "não consegu") {
-						category = "Continua impactando"
-					}
+		sectionKeywords := map[string]string{
+			"sem impacto agora":    "no_impact",
+			"sem impacto na":       "no_impact",
+			"não afetam":           "no_impact",
+			"não impactam":         "no_impact",
+			"não afeta":            "no_impact",
+			"continua impactando":  "impacting",
+			"continuam impactando": "impacting",
+			"seguem impactando":    "impacting",
+			"segue impactando":     "impacting",
+			"não consegui":         "impacting",
+			"não foi possível":     "impacting",
+			"excluída agora":       "excluded",
+			"excluídas agora":      "excluded",
+			"excluído agora":       "excluded",
+			"excluídos agora":      "excluded",
+			"removida agora":       "excluded",
+			"removidas agora":      "excluded",
+			"removido agora":       "excluded",
+			"removidos agora":      "excluded",
+			"foram excluíd":        "excluded",
+			"foram removid":        "excluded",
+			"foi excluíd":          "excluded",
+			"foi removid":          "excluded",
+			"xcluída agora":        "excluded",
+			"xcluídas agora":       "excluded",
+		}
+
+		for keyword, cat := range sectionKeywords {
+			idx := 0
+			for {
+				pos := strings.Index(responseLower[idx:], keyword)
+				if pos < 0 {
+					break
 				}
-			} else {
-				// Number not found in response at all — check if response mentions
-				// total counts that can help
-				if strings.Contains(responseLower, "nenhum") && strings.Contains(responseLower, "aprovad") {
-					category = "Continua impactando"
+				markers = append(markers, sectionMarker{pos: idx + pos, category: cat})
+				idx += pos + len(keyword)
+			}
+		}
+
+		// Sort markers by position
+		for i := 0; i < len(markers); i++ {
+			for j := i + 1; j < len(markers); j++ {
+				if markers[j].pos < markers[i].pos {
+					markers[i], markers[j] = markers[j], markers[i]
 				}
 			}
 		}
 
-		results = append(results, claimResult{Number: num, Category: category})
+		for _, num := range originalNumbers {
+			pos := strings.Index(responseLower, num)
+			if pos < 0 {
+				continue
+			}
+			category := ""
+			for _, m := range markers {
+				if m.pos < pos {
+					category = m.category
+				}
+			}
+			if category != "" {
+				numberCategories[num] = category
+			}
+		}
+	}
+
+	// Build results
+	results := make([]claimResult, 0, len(originalNumbers))
+	for _, num := range originalNumbers {
+		cat, found := numberCategories[num]
+		label := "Não identificado na resposta"
+		if found {
+			switch cat {
+			case "excluded":
+				label = "Excluída"
+			case "no_impact":
+				label = "Sem impacto na reputação"
+			case "impacting":
+				label = "Continua impactando"
+			}
+		} else if strings.Contains(responseLower, "nenhum") && (strings.Contains(responseLower, "aprovad") || strings.Contains(responseLower, "remoção")) {
+			label = "Continua impactando"
+		}
+		results = append(results, claimResult{Number: num, Category: label})
 	}
 
 	return results
