@@ -42,6 +42,8 @@ func main() {
 
 	reader := bufio.NewReader(os.Stdin)
 
+	headless := selectMode(reader)
+
 	profileDir := getProfileDir()
 	fmt.Printf("[INFO] Perfil do Chrome: %s\n", profileDir)
 
@@ -61,9 +63,13 @@ func main() {
 		fmt.Printf("[INFO] Chrome encontrado: %s\n", chromePath)
 	}
 
-	opts := buildAllocOpts(profileDir, chromePath)
+	opts := buildAllocOpts(profileDir, headless, chromePath)
 
-	fmt.Println("[INFO] Iniciando o Chrome...")
+	if headless {
+		fmt.Println("[INFO] Iniciando o Chrome em modo headless...")
+	} else {
+		fmt.Println("[INFO] Iniciando o Chrome...")
+	}
 
 	allocCtx, allocCancel := chromedp.NewExecAllocator(ctx, opts...)
 	defer allocCancel()
@@ -748,7 +754,7 @@ func cleanInputs(inputs []string) []string {
 
 // --- Chrome setup ---
 
-func buildAllocOpts(profileDir string, chromePath string) []chromedp.ExecAllocatorOption {
+func buildAllocOpts(profileDir string, headless bool, chromePath string) []chromedp.ExecAllocatorOption {
 	opts := append(chromedp.DefaultExecAllocatorOptions[:],
 		chromedp.UserDataDir(profileDir),
 		chromedp.Flag("disable-gpu", false),
@@ -756,13 +762,44 @@ func buildAllocOpts(profileDir string, chromePath string) []chromedp.ExecAllocat
 		chromedp.Flag("no-default-browser-check", true),
 		chromedp.Flag("disable-extensions", false),
 		chromedp.Flag("no-sandbox", true),
-		chromedp.Flag("headless", false), // Always visible — user needs to see the chat
 		chromedp.WindowSize(1280, 900),
 	)
+	if headless {
+		opts = append(opts, chromedp.Flag("headless", "new"))
+		opts = append(opts, chromedp.Flag("disable-blink-features", "AutomationControlled"))
+		opts = append(opts, chromedp.UserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"))
+	} else {
+		opts = append(opts, chromedp.Flag("headless", false))
+	}
 	if chromePath != "" {
 		opts = append(opts, chromedp.ExecPath(chromePath))
 	}
 	return opts
+}
+
+func selectMode(reader *bufio.Reader) bool {
+	fmt.Println("Selecione o modo de execução:")
+	fmt.Println("  1 - Chrome visível (mais consumo de memória e CPU)")
+	fmt.Println("  2 - Chrome em background (mais performance)")
+	fmt.Println()
+
+	for {
+		fmt.Print("Opção (1 ou 2): ")
+		line, _ := reader.ReadString('\n')
+		choice := strings.TrimSpace(line)
+		switch choice {
+		case "1":
+			fmt.Println("[INFO] Modo: Chrome visível")
+			fmt.Println()
+			return false
+		case "2":
+			fmt.Println("[INFO] Modo: Chrome em background")
+			fmt.Println()
+			return true
+		default:
+			fmt.Println("  Opção inválida. Digite 1 ou 2.")
+		}
+	}
 }
 
 func getProfileDir() string {
