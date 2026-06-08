@@ -354,8 +354,8 @@ func processBatch(ctx context.Context, numbers []string, isFirstBatch bool) ([]c
 	}
 
 	// Step 7: Wait for the analysis response
-	fmt.Println("  Aguardando análise do MELI (pode levar até 60 segundos)...")
-	if err := waitForResponse(ctx, countBeforeNumbers, 90*time.Second); err != nil {
+	fmt.Println("  Aguardando análise do MELI (pode levar alguns minutos)...")
+	if err := waitForResponse(ctx, countBeforeNumbers, 5*time.Minute); err != nil {
 		return nil, fmt.Errorf("aguardar análise: %w", err)
 	}
 
@@ -477,10 +477,11 @@ func getAssistantMsgCount(ctx context.Context) int {
 // initialCount is the number of assistant messages before the user message was sent.
 func waitForResponse(ctx context.Context, initialCount int, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
-	time.Sleep(2 * time.Second)
+	time.Sleep(3 * time.Second)
 
 	prevText := ""
 	stableCount := 0
+	requiredStable := 5
 
 	for time.Now().Before(deadline) {
 		currentCount := getAssistantMsgCount(ctx)
@@ -502,8 +503,8 @@ func waitForResponse(ctx context.Context, initialCount int, timeout time.Duratio
 
 			if currentText != "" && currentText == prevText {
 				stableCount++
-				if stableCount >= 3 {
-					return nil // text hasn't changed in ~6s
+				if stableCount >= requiredStable {
+					return nil // text stabilized
 				}
 			} else {
 				stableCount = 0
@@ -511,7 +512,7 @@ func waitForResponse(ctx context.Context, initialCount int, timeout time.Duratio
 			}
 		}
 
-		time.Sleep(2 * time.Second)
+		time.Sleep(3 * time.Second)
 	}
 
 	// If we got some text despite timeout, consider it done
@@ -736,7 +737,7 @@ func readInputs(lineCh <-chan string) []string {
 }
 
 func cleanInputs(inputs []string) []string {
-	re := regexp.MustCompile(`\d{7,13}`)
+	re := regexp.MustCompile(`\d{7,20}`)
 	seen := make(map[string]bool)
 	var result []string
 	for _, input := range inputs {
