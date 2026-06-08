@@ -354,8 +354,8 @@ func processBatch(ctx context.Context, numbers []string, isFirstBatch bool) ([]c
 	}
 
 	// Step 7: Wait for the analysis response
-	fmt.Println("  Aguardando análise do MELI (pode levar alguns minutos)...")
-	if err := waitForResponse(ctx, countBeforeNumbers, 5*time.Minute); err != nil {
+	fmt.Println("  Aguardando análise do MELI (timeout: 30 minutos)...")
+	if err := waitForResponse(ctx, countBeforeNumbers, 30*time.Minute); err != nil {
 		return nil, fmt.Errorf("aguardar análise: %w", err)
 	}
 
