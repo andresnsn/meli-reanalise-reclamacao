@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -23,7 +24,6 @@ const (
 	loginCheckURL   = "https://www.mercadolivre.com.br/vendas/omni/lista"
 	chatPageURL     = "https://www.mercadolivre.com.br/metricas/meu-atendimento/resumo"
 	loginTimeoutMin = 5
-	batchSize       = 50
 )
 
 // claimResult holds the parsed result for each claim/sale number.
@@ -43,6 +43,7 @@ func main() {
 	reader := bufio.NewReader(os.Stdin)
 
 	headless := selectMode(reader)
+	batchSize := selectBatchSize(reader)
 
 	profileDir := getProfileDir()
 	fmt.Printf("[INFO] Perfil do Chrome: %s\n", profileDir)
@@ -113,7 +114,6 @@ func main() {
 			continue
 		}
 
-		// Process in batches of 50
 		var allResults []claimResult
 		batchCount := (total + batchSize - 1) / batchSize
 
@@ -801,6 +801,27 @@ func selectMode(reader *bufio.Reader) bool {
 			fmt.Println("  Opção inválida. Digite 1 ou 2.")
 		}
 	}
+}
+
+func selectBatchSize(reader *bufio.Reader) int {
+	fmt.Println("Quantos números enviar por lote? (1 a 100, padrão: 50)")
+	fmt.Print("Quantidade: ")
+	line, _ := reader.ReadString('\n')
+	choice := strings.TrimSpace(line)
+	if choice == "" {
+		fmt.Println("[INFO] Usando padrão: 50 por lote")
+		fmt.Println()
+		return 50
+	}
+	n, err := strconv.Atoi(choice)
+	if err != nil || n < 1 || n > 100 {
+		fmt.Println("  Valor inválido. Usando padrão: 50 por lote")
+		fmt.Println()
+		return 50
+	}
+	fmt.Printf("[INFO] Lote: %d números por vez\n", n)
+	fmt.Println()
+	return n
 }
 
 func getProfileDir() string {
