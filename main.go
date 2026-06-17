@@ -84,6 +84,11 @@ func main() {
 		log.Fatalf("[ERRO] Falha ao verificar login: %v", err)
 	}
 
+	// Open the chat page once and keep it open
+	if err := openChat(browserCtx); err != nil {
+		log.Fatalf("[ERRO] Falha ao abrir o chat: %v", err)
+	}
+
 	// Persistent line reader for paste-friendly input
 	lineCh := make(chan string, 1000)
 	go func() {
@@ -134,7 +139,7 @@ func main() {
 
 			fmt.Printf("━━━ Lote %d/%d (%d números) ━━━\n", b+1, batchCount, len(batch))
 
-			results, err := processBatch(browserCtx, batch, b == 0)
+			results, err := processBatch(browserCtx, batch)
 			if err != nil {
 				fmt.Printf("[ERRO] Falha no lote %d: %v\n", b+1, err)
 				// Mark all in this batch as error
@@ -168,22 +173,21 @@ func main() {
 	fmt.Println("[INFO] Programa encerrado.")
 }
 
-// processBatch handles a single batch of up to 50 numbers via the MELI chat.
-// The chat widget is rendered inside an iframe, so all JS queries use a helper
-// function that searches both the main document and any iframes/shadow roots.
-func processBatch(ctx context.Context, numbers []string, isFirstBatch bool) ([]claimResult, error) {
-	// Step 1: Navigate to the chat page
-	fmt.Println("  Navegando para a página de métricas...")
+// openChat navigates to the metrics page, clicks the assistant button,
+// finds the chat context (iframe/shadow/main), and sets up JS helpers.
+// This is called once at startup; the page stays open for all batches.
+func openChat(ctx context.Context) error {
+	fmt.Println("[INFO] Navegando para a página de métricas...")
 	if err := chromedp.Run(ctx,
 		chromedp.Navigate(chatPageURL),
 		chromedp.WaitReady("body", chromedp.ByQuery),
 	); err != nil {
-		return nil, fmt.Errorf("navegar para métricas: %w", err)
+		return fmt.Errorf("navegar para métricas: %w", err)
 	}
 	time.Sleep(5 * time.Second)
 
-	// Step 2: Open the assistant chat by clicking the floating button
-	fmt.Println("  Abrindo o assistente...")
+	// Click the assistant floating button
+	fmt.Println("[INFO] Abrindo o assistente...")
 	for attempt := 0; attempt < 3; attempt++ {
 		chromedp.Run(ctx, chromedp.Evaluate(`
 			(function() {
@@ -210,11 +214,9 @@ func processBatch(ctx context.Context, numbers []string, isFirstBatch bool) ([]c
 		`, nil))
 		time.Sleep(3 * time.Second)
 
-		// Check if chat opened (look for iframe or chat elements)
 		var found bool
 		chromedp.Run(ctx, chromedp.Evaluate(`
 			(function() {
-				// Chat might be in an iframe
 				var iframes = document.querySelectorAll('iframe');
 				for (var i = 0; i < iframes.length; i++) {
 					try {
@@ -222,7 +224,6 @@ func processBatch(ctx context.Context, numbers []string, isFirstBatch bool) ([]c
 						if (doc && doc.querySelector('#chat-input, .chat-messages')) return true;
 					} catch(e) {}
 				}
-				// Or directly in the DOM
 				return document.querySelector('#chat-input, .chat-messages') !== null;
 			})()
 		`, &found))
@@ -231,28 +232,22 @@ func processBatch(ctx context.Context, numbers []string, isFirstBatch bool) ([]c
 		}
 	}
 
-	// Step 3: Find the chat input - search in main document, iframes, and shadow roots
-	fmt.Println("  Verificando se o chat está aberto...")
+	// Find chat context (iframe/shadow/main)
+	fmt.Println("[INFO] Verificando se o chat está aberto...")
 	var chatFound bool
-	var chatLocation string // "main", "iframe", "shadow"
+	var chatLocation string
 	for attempt := 0; attempt < 20; attempt++ {
 		chromedp.Run(ctx, chromedp.Evaluate(`
 			(function() {
-				// Check main document
 				if (document.querySelector('#chat-input')) return 'main';
-				// Check iframes
 				var iframes = document.querySelectorAll('iframe');
 				for (var i = 0; i < iframes.length; i++) {
 					try {
 						var doc = iframes[i].contentDocument || iframes[i].contentWindow.document;
 						if (doc && doc.querySelector('#chat-input')) return 'iframe-' + i;
-						// Also check for textarea with placeholder
 						if (doc && doc.querySelector('textarea[placeholder*="Pergunte"]')) return 'iframe-' + i;
-					} catch(e) {
-						// Cross-origin iframe - can't access
-					}
+					} catch(e) {}
 				}
-				// Check shadow roots
 				var all = document.querySelectorAll('*');
 				for (var i = 0; i < all.length; i++) {
 					if (all[i].shadowRoot) {
@@ -266,7 +261,7 @@ func processBatch(ctx context.Context, numbers []string, isFirstBatch bool) ([]c
 
 		if chatLocation != "" {
 			chatFound = true
-			fmt.Printf("  Chat encontrado em: %s\n", chatLocation)
+			fmt.Printf("[INFO] Chat encontrado em: %s\n", chatLocation)
 			break
 		}
 		if attempt%5 == 4 {
@@ -287,11 +282,10 @@ func processBatch(ctx context.Context, numbers []string, isFirstBatch bool) ([]c
 	}
 
 	if !chatFound {
-		return nil, fmt.Errorf("chat não abriu - input não encontrado")
+		return fmt.Errorf("chat não abriu - input não encontrado")
 	}
 
-	// Helper JS function that queries inside the correct context (iframe/shadow/main)
-	// We'll inject this as a function in the page
+	// Inject JS helper to query inside the correct context
 	queryFnSetup := fmt.Sprintf(`
 		window.__chatCtx = '%s';
 		window.__getChatDoc = function() {
@@ -312,26 +306,83 @@ func processBatch(ctx context.Context, numbers []string, isFirstBatch bool) ([]c
 	`, chatLocation)
 	chromedp.Run(ctx, chromedp.Evaluate(queryFnSetup, nil))
 
-	// Step 4: Start a new conversation
-	fmt.Println("  Iniciando nova conversa...")
-	chromedp.Run(ctx, chromedp.Evaluate(`
-		(function() {
-			var doc = window.__getChatDoc();
-			if (!doc) return false;
-			var btns = doc.querySelectorAll('button');
-			for (var i = 0; i < btns.length; i++) {
-				var label = btns[i].getAttribute('aria-label') || '';
-				if (label.includes('nova') || label.includes('new') || label.includes('Nova conversa')) {
-					btns[i].click();
-					return true;
-				}
-			}
-			return false;
-		})()
-	`, nil))
-	time.Sleep(2 * time.Second)
+	fmt.Println("[OK] Chat aberto e pronto para uso.")
+	return nil
+}
 
-	// Step 5: Send the initial prompt
+// startNewConversation clicks the "Editar" (new conversation) button and waits
+// until the chat resets — either the greeting message appears or the message
+// count drops to 0/1. Retries every 5 seconds.
+func startNewConversation(ctx context.Context) error {
+	fmt.Println("  Iniciando nova conversa...")
+
+	deadline := time.Now().Add(2 * time.Minute)
+	for time.Now().Before(deadline) {
+		// Click the edit/new conversation button
+		chromedp.Run(ctx, chromedp.Evaluate(`
+			(function() {
+				var doc = window.__getChatDoc();
+				if (!doc) return 'no-doc';
+				// Try #sa-icon-edit-chat first
+				var btn = doc.querySelector('#sa-icon-edit-chat');
+				if (btn) { btn.click(); return 'clicked-edit'; }
+				// Try button with aria-label "Editar"
+				var btns = doc.querySelectorAll('button');
+				for (var i = 0; i < btns.length; i++) {
+					var label = btns[i].getAttribute('aria-label') || '';
+					if (label === 'Editar' || label.includes('nova') || label.includes('Nova conversa')) {
+						btns[i].click();
+						return 'clicked-' + label;
+					}
+				}
+				// Try by class
+				btn = doc.querySelector('.assistant-chat-header__toolbar-action--edit');
+				if (btn) { btn.click(); return 'clicked-class'; }
+				return 'not-found';
+			})()
+		`, nil))
+
+		time.Sleep(5 * time.Second)
+
+		// Check if new conversation started
+		var ready bool
+		chromedp.Run(ctx, chromedp.Evaluate(`
+			(function() {
+				var doc = window.__getChatDoc();
+				if (!doc) return false;
+				// Check if greeting message appeared ("Olá" / "Como posso te ajudar")
+				var msgs = doc.querySelectorAll('.message-item--assistant');
+				if (msgs.length === 0) return true; // chat reset, no messages
+				if (msgs.length === 1) {
+					var text = msgs[0].textContent || '';
+					if (text.includes('Olá') || text.includes('Como posso') || text.includes('ajudar')) return true;
+				}
+				// Also check if message count is low (fresh chat)
+				var userMsgs = doc.querySelectorAll('.message-item--user');
+				if (userMsgs.length === 0) return true; // no user messages = fresh chat
+				return false;
+			})()
+		`, &ready))
+
+		if ready {
+			fmt.Println("  Nova conversa iniciada com sucesso.")
+			return nil
+		}
+		fmt.Println("  Conversa ainda não resetou, tentando novamente...")
+	}
+
+	return fmt.Errorf("timeout ao iniciar nova conversa")
+}
+
+// processBatch handles a single batch of numbers via the MELI chat.
+// Assumes the chat is already open (openChat was called once).
+func processBatch(ctx context.Context, numbers []string) ([]claimResult, error) {
+	// Step 1: Start a new conversation
+	if err := startNewConversation(ctx); err != nil {
+		return nil, fmt.Errorf("nova conversa: %w", err)
+	}
+
+	// Step 2: Send the initial prompt
 	prompt := "Remova as reclamações abaixo que estão impactando minha reputação e podem ser excluídas:"
 	fmt.Println("  Enviando prompt...")
 	countBeforePrompt := getAssistantMsgCount(ctx)
@@ -345,7 +396,7 @@ func processBatch(ctx context.Context, numbers []string, isFirstBatch bool) ([]c
 		return nil, fmt.Errorf("aguardar resposta: %w", err)
 	}
 
-	// Step 6: Send the numbers
+	// Step 3: Send the numbers
 	numbersText := strings.Join(numbers, "\n")
 	fmt.Printf("  Enviando %d números...\n", len(numbers))
 	countBeforeNumbers := getAssistantMsgCount(ctx)
@@ -353,13 +404,13 @@ func processBatch(ctx context.Context, numbers []string, isFirstBatch bool) ([]c
 		return nil, fmt.Errorf("enviar números: %w", err)
 	}
 
-	// Step 7: Wait for the analysis response
+	// Step 4: Wait for the analysis response
 	fmt.Println("  Aguardando análise do MELI (timeout: 30 minutos)...")
 	if err := waitForResponse(ctx, countBeforeNumbers, 30*time.Minute); err != nil {
 		return nil, fmt.Errorf("aguardar análise: %w", err)
 	}
 
-	// Step 8: Extract the response
+	// Step 5: Extract the response
 	fmt.Println("  Coletando resposta...")
 	responseText, err := getLastAssistantMessage(ctx)
 	if err != nil {
@@ -372,7 +423,7 @@ func processBatch(ctx context.Context, numbers []string, isFirstBatch bool) ([]c
 	}
 	fmt.Println()
 
-	// Step 9: Parse the response
+	// Step 6: Parse the response
 	results := parseResponse(responseText, numbers)
 	return results, nil
 }
