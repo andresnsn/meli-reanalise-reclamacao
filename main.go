@@ -310,23 +310,19 @@ func openChat(ctx context.Context) error {
 	return nil
 }
 
-// startNewConversation clicks the "Editar" (new conversation) button and waits
-// until the chat resets — either the greeting message appears or the message
-// count drops to 0/1. Retries every 5 seconds.
+// startNewConversation clicks the "Editar" (new conversation) button,
+// waits 5s, checks if chat reset. If not, clicks again. Repeats up to 10 times.
 func startNewConversation(ctx context.Context) error {
 	fmt.Println("  Iniciando nova conversa...")
 
-	deadline := time.Now().Add(2 * time.Minute)
-	for time.Now().Before(deadline) {
+	for attempt := 0; attempt < 10; attempt++ {
 		// Click the edit/new conversation button
 		chromedp.Run(ctx, chromedp.Evaluate(`
 			(function() {
 				var doc = window.__getChatDoc();
 				if (!doc) return 'no-doc';
-				// Try #sa-icon-edit-chat first
 				var btn = doc.querySelector('#sa-icon-edit-chat');
 				if (btn) { btn.click(); return 'clicked-edit'; }
-				// Try button with aria-label "Editar"
 				var btns = doc.querySelectorAll('button');
 				for (var i = 0; i < btns.length; i++) {
 					var label = btns[i].getAttribute('aria-label') || '';
@@ -335,7 +331,6 @@ func startNewConversation(ctx context.Context) error {
 						return 'clicked-' + label;
 					}
 				}
-				// Try by class
 				btn = doc.querySelector('.assistant-chat-header__toolbar-action--edit');
 				if (btn) { btn.click(); return 'clicked-class'; }
 				return 'not-found';
@@ -344,22 +339,20 @@ func startNewConversation(ctx context.Context) error {
 
 		time.Sleep(5 * time.Second)
 
-		// Check if new conversation started
+		// Check if chat reset
 		var ready bool
 		chromedp.Run(ctx, chromedp.Evaluate(`
 			(function() {
 				var doc = window.__getChatDoc();
 				if (!doc) return false;
-				// Check if greeting message appeared ("Olá" / "Como posso te ajudar")
 				var msgs = doc.querySelectorAll('.message-item--assistant');
-				if (msgs.length === 0) return true; // chat reset, no messages
+				if (msgs.length === 0) return true;
 				if (msgs.length === 1) {
 					var text = msgs[0].textContent || '';
 					if (text.includes('Olá') || text.includes('Como posso') || text.includes('ajudar')) return true;
 				}
-				// Also check if message count is low (fresh chat)
 				var userMsgs = doc.querySelectorAll('.message-item--user');
-				if (userMsgs.length === 0) return true; // no user messages = fresh chat
+				if (userMsgs.length === 0) return true;
 				return false;
 			})()
 		`, &ready))
@@ -368,10 +361,10 @@ func startNewConversation(ctx context.Context) error {
 			fmt.Println("  Nova conversa iniciada com sucesso.")
 			return nil
 		}
-		fmt.Println("  Conversa ainda não resetou, tentando novamente...")
+		fmt.Printf("  Chat não resetou, clicando novamente... (tentativa %d)\n", attempt+2)
 	}
 
-	return fmt.Errorf("timeout ao iniciar nova conversa")
+	return fmt.Errorf("não conseguiu iniciar nova conversa após 10 tentativas")
 }
 
 // processBatch handles a single batch of numbers via the MELI chat.
