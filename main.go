@@ -362,11 +362,14 @@ func startNewConversation(ctx context.Context) error {
 			return nil
 		}
 		fmt.Printf("  Chat não resetou, enviando 'teste' e tentando novamente... (tentativa %d)\n", attempt+2)
-		// Send "teste" twice to unblock the chat before retrying
+		// Send "teste" twice, waiting for chat response each time
+		countBefore := getAssistantMsgCount(ctx)
 		sendChatMessage(ctx, "teste")
-		time.Sleep(2 * time.Second)
+		waitForResponse(ctx, countBefore, 30*time.Second)
+
+		countBefore = getAssistantMsgCount(ctx)
 		sendChatMessage(ctx, "teste")
-		time.Sleep(2 * time.Second)
+		waitForResponse(ctx, countBefore, 30*time.Second)
 	}
 
 	return fmt.Errorf("não conseguiu iniciar nova conversa após 10 tentativas")
