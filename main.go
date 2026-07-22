@@ -26,6 +26,59 @@ const (
 	loginTimeoutMin = 5
 )
 
+// deepQueryJS defines helpers that search for elements across the whole page,
+// crossing same-origin iframes AND shadow roots. The MELI assistant renders its
+// chat inside an <iframe> that is itself nested inside a shadow root
+// (host: div#sof-seller-assistant-frm-host), so a plain
+// document.querySelectorAll('iframe') no longer reaches the chat input. These
+// helpers recurse through shadow roots and iframe documents to find it.
+const deepQueryJS = `
+(function() {
+	if (window.__meliDeepQuery) return;
+	window.__meliDeepQuery = function(sel) {
+		function search(root) {
+			var el = null;
+			try { el = root.querySelector(sel); } catch (e) { el = null; }
+			if (el) return el;
+			var all;
+			try { all = root.querySelectorAll('*'); } catch (e) { return null; }
+			for (var i = 0; i < all.length; i++) {
+				var node = all[i];
+				if (node.shadowRoot) { var r = search(node.shadowRoot); if (r) return r; }
+				if (node.tagName === 'IFRAME') {
+					var d = null;
+					try { d = node.contentDocument || (node.contentWindow && node.contentWindow.document); } catch (e) { d = null; }
+					if (d) { var r2 = search(d); if (r2) return r2; }
+				}
+			}
+			return null;
+		}
+		return search(document);
+	};
+	window.__meliDeepQueryAll = function(sel) {
+		var results = [];
+		function search(root) {
+			var els;
+			try { els = root.querySelectorAll(sel); } catch (e) { els = []; }
+			for (var i = 0; i < els.length; i++) results.push(els[i]);
+			var all;
+			try { all = root.querySelectorAll('*'); } catch (e) { return; }
+			for (var j = 0; j < all.length; j++) {
+				var node = all[j];
+				if (node.shadowRoot) search(node.shadowRoot);
+				if (node.tagName === 'IFRAME') {
+					var d = null;
+					try { d = node.contentDocument || (node.contentWindow && node.contentWindow.document); } catch (e) { d = null; }
+					if (d) search(d);
+				}
+			}
+		}
+		search(document);
+		return results;
+	};
+})();
+`
+
 // claimResult holds the parsed result for each claim/sale number.
 type claimResult struct {
 	Number   string
@@ -215,16 +268,9 @@ func openChat(ctx context.Context) error {
 		time.Sleep(3 * time.Second)
 
 		var found bool
-		chromedp.Run(ctx, chromedp.Evaluate(`
+		chromedp.Run(ctx, chromedp.Evaluate(deepQueryJS+`
 			(function() {
-				var iframes = document.querySelectorAll('iframe');
-				for (var i = 0; i < iframes.length; i++) {
-					try {
-						var doc = iframes[i].contentDocument || iframes[i].contentWindow.document;
-						if (doc && doc.querySelector('#chat-input, .chat-messages')) return true;
-					} catch(e) {}
-				}
-				return document.querySelector('#chat-input, .chat-messages') !== null;
+				return !!(window.__meliDeepQuery('#chat-input') || window.__meliDeepQuery('.chat-messages'));
 			})()
 		`, &found))
 		if found {
@@ -232,36 +278,21 @@ func openChat(ctx context.Context) error {
 		}
 	}
 
-	// Find chat context (iframe/shadow/main)
+	// Find the chat input, crossing iframes and shadow DOM.
 	fmt.Println("[INFO] Verificando se o chat está aberto...")
 	var chatFound bool
-	var chatLocation string
 	for attempt := 0; attempt < 20; attempt++ {
-		chromedp.Run(ctx, chromedp.Evaluate(`
+		chromedp.Run(ctx, chromedp.Evaluate(deepQueryJS+`
 			(function() {
-				if (document.querySelector('#chat-input')) return 'main';
-				var iframes = document.querySelectorAll('iframe');
-				for (var i = 0; i < iframes.length; i++) {
-					try {
-						var doc = iframes[i].contentDocument || iframes[i].contentWindow.document;
-						if (doc && doc.querySelector('#chat-input')) return 'iframe-' + i;
-						if (doc && doc.querySelector('textarea[placeholder*="Pergunte"]')) return 'iframe-' + i;
-					} catch(e) {}
-				}
-				var all = document.querySelectorAll('*');
-				for (var i = 0; i < all.length; i++) {
-					if (all[i].shadowRoot) {
-						if (all[i].shadowRoot.querySelector('#chat-input')) return 'shadow';
-						if (all[i].shadowRoot.querySelector('textarea[placeholder*="Pergunte"]')) return 'shadow';
-					}
-				}
-				return '';
+				var input = window.__meliDeepQuery('#chat-input') ||
+							window.__meliDeepQuery('textarea[placeholder*="Pergunte"]') ||
+							window.__meliDeepQuery('textarea[aria-label*="mensagem"]');
+				return !!input;
 			})()
-		`, &chatLocation))
+		`, &chatFound))
 
-		if chatLocation != "" {
-			chatFound = true
-			fmt.Printf("[INFO] Chat encontrado em: %s\n", chatLocation)
+		if chatFound {
+			fmt.Println("[INFO] Chat encontrado (input localizado).")
 			break
 		}
 		if attempt%5 == 4 {
@@ -285,26 +316,8 @@ func openChat(ctx context.Context) error {
 		return fmt.Errorf("chat não abriu - input não encontrado")
 	}
 
-	// Inject JS helper to query inside the correct context
-	queryFnSetup := fmt.Sprintf(`
-		window.__chatCtx = '%s';
-		window.__getChatDoc = function() {
-			if (window.__chatCtx.startsWith('iframe')) {
-				var idx = parseInt(window.__chatCtx.split('-')[1]);
-				var iframe = document.querySelectorAll('iframe')[idx];
-				if (iframe) return iframe.contentDocument || iframe.contentWindow.document;
-			}
-			if (window.__chatCtx === 'shadow') {
-				var all = document.querySelectorAll('*');
-				for (var i = 0; i < all.length; i++) {
-					if (all[i].shadowRoot && all[i].shadowRoot.querySelector('#chat-input'))
-						return all[i].shadowRoot;
-				}
-			}
-			return document;
-		};
-	`, chatLocation)
-	chromedp.Run(ctx, chromedp.Evaluate(queryFnSetup, nil))
+	// Pre-inject the deep-query helpers so all later steps can reuse them.
+	chromedp.Run(ctx, chromedp.Evaluate(deepQueryJS+`true`, nil))
 
 	fmt.Println("[OK] Chat aberto e pronto para uso.")
 	return nil
@@ -317,13 +330,11 @@ func startNewConversation(ctx context.Context) error {
 
 	for attempt := 0; attempt < 10; attempt++ {
 		// Click the edit/new conversation button
-		chromedp.Run(ctx, chromedp.Evaluate(`
+		chromedp.Run(ctx, chromedp.Evaluate(deepQueryJS+`
 			(function() {
-				var doc = window.__getChatDoc();
-				if (!doc) return 'no-doc';
-				var btn = doc.querySelector('#sa-icon-edit-chat');
+				var btn = window.__meliDeepQuery('#sa-icon-edit-chat');
 				if (btn) { btn.click(); return 'clicked-edit'; }
-				var btns = doc.querySelectorAll('button');
+				var btns = window.__meliDeepQueryAll('button');
 				for (var i = 0; i < btns.length; i++) {
 					var label = btns[i].getAttribute('aria-label') || '';
 					if (label === 'Editar' || label.includes('nova') || label.includes('Nova conversa')) {
@@ -331,7 +342,7 @@ func startNewConversation(ctx context.Context) error {
 						return 'clicked-' + label;
 					}
 				}
-				btn = doc.querySelector('.assistant-chat-header__toolbar-action--edit');
+				btn = window.__meliDeepQuery('.assistant-chat-header__toolbar-action--edit');
 				if (btn) { btn.click(); return 'clicked-class'; }
 				return 'not-found';
 			})()
@@ -341,17 +352,15 @@ func startNewConversation(ctx context.Context) error {
 
 		// Check if chat reset
 		var ready bool
-		chromedp.Run(ctx, chromedp.Evaluate(`
+		chromedp.Run(ctx, chromedp.Evaluate(deepQueryJS+`
 			(function() {
-				var doc = window.__getChatDoc();
-				if (!doc) return false;
-				var msgs = doc.querySelectorAll('.message-item--assistant');
+				var msgs = window.__meliDeepQueryAll('.message-item--assistant');
 				if (msgs.length === 0) return true;
 				if (msgs.length === 1) {
 					var text = msgs[0].textContent || '';
 					if (text.includes('Olá') || text.includes('Como posso') || text.includes('ajudar')) return true;
 				}
-				var userMsgs = doc.querySelectorAll('.message-item--user');
+				var userMsgs = window.__meliDeepQueryAll('.message-item--user');
 				if (userMsgs.length === 0) return true;
 				return false;
 			})()
@@ -433,33 +442,22 @@ func processBatch(ctx context.Context, numbers []string) ([]claimResult, error) 
 // Uses the iframe's own window for React value setters and events.
 func sendChatMessage(ctx context.Context, message string) error {
 	var result string
-	if err := chromedp.Run(ctx, chromedp.Evaluate(fmt.Sprintf(`
+	if err := chromedp.Run(ctx, chromedp.Evaluate(deepQueryJS+fmt.Sprintf(`
 		(function() {
-			// Resolve the iframe window and document
-			var iframeWin, iframeDoc;
-			if (window.__chatCtx && window.__chatCtx.startsWith('iframe')) {
-				var idx = parseInt(window.__chatCtx.split('-')[1]);
-				var iframe = document.querySelectorAll('iframe')[idx];
-				if (!iframe) return 'no-iframe';
-				iframeWin = iframe.contentWindow;
-				iframeDoc = iframe.contentDocument || iframeWin.document;
-			} else {
-				iframeWin = window;
-				iframeDoc = document;
-			}
-			if (!iframeDoc) return 'no-doc';
-
-			var input = iframeDoc.querySelector('#chat-input') ||
-						iframeDoc.querySelector('textarea[placeholder*="Pergunte"]') ||
-						iframeDoc.querySelector('textarea[aria-label*="chat"]');
+			var input = window.__meliDeepQuery('#chat-input') ||
+						window.__meliDeepQuery('textarea[placeholder*="Pergunte"]') ||
+						window.__meliDeepQuery('textarea[aria-label*="mensagem"]') ||
+						window.__meliDeepQuery('textarea[aria-label*="chat"]');
 			if (!input) return 'no-input';
 
+			// Resolve the window that owns the input (iframe window for React setter).
+			var win = input.ownerDocument.defaultView || window;
 			input.focus();
-			// Use the IFRAME's own prototype setter (critical for React)
-			var setter = Object.getOwnPropertyDescriptor(iframeWin.HTMLTextAreaElement.prototype, 'value').set;
+			// Use the owning window's prototype setter (critical for React)
+			var setter = Object.getOwnPropertyDescriptor(win.HTMLTextAreaElement.prototype, 'value').set;
 			setter.call(input, %q);
-			// Dispatch events using the iframe's own Event constructor
-			input.dispatchEvent(new iframeWin.Event('input', { bubbles: true }));
+			// Dispatch events using the owning window's Event constructor
+			input.dispatchEvent(new win.Event('input', { bubbles: true }));
 			input.style.height = 'auto';
 			input.style.height = input.scrollHeight + 'px';
 			return 'ok';
@@ -474,37 +472,24 @@ func sendChatMessage(ctx context.Context, message string) error {
 	time.Sleep(500 * time.Millisecond)
 
 	// Send: try clicking send button, then fall back to Enter key
-	chromedp.Run(ctx, chromedp.Evaluate(`
+	chromedp.Run(ctx, chromedp.Evaluate(deepQueryJS+`
 		(function() {
-			var iframeWin, iframeDoc;
-			if (window.__chatCtx && window.__chatCtx.startsWith('iframe')) {
-				var idx = parseInt(window.__chatCtx.split('-')[1]);
-				var iframe = document.querySelectorAll('iframe')[idx];
-				if (!iframe) return 'no-iframe';
-				iframeWin = iframe.contentWindow;
-				iframeDoc = iframe.contentDocument || iframeWin.document;
-			} else {
-				iframeWin = window;
-				iframeDoc = document;
-			}
-			if (!iframeDoc) return 'no-doc';
+			var input = window.__meliDeepQuery('#chat-input') ||
+						window.__meliDeepQuery('textarea[placeholder*="Pergunte"]');
+			if (!input) return 'no-input';
+			var win = input.ownerDocument.defaultView || window;
 
-			// Look for send button
-			var btns = iframeDoc.querySelectorAll('button');
+			// Look for a send button anywhere (crossing iframe/shadow)
+			var btns = window.__meliDeepQueryAll('button');
 			for (var i = 0; i < btns.length; i++) {
 				var label = btns[i].getAttribute('aria-label') || '';
-				if (label.includes('nviar') || label.includes('end') || label.includes('Enviar')) {
-					btns[i].click();
-					return 'sent-button';
+				if (label.includes('nviar') || label.includes('Enviar') || label.includes('Send') || label.includes('end message')) {
+					if (!btns[i].disabled) { btns[i].click(); return 'sent-button'; }
 				}
 			}
 			// Fallback: Enter key on the input
-			var input = iframeDoc.querySelector('#chat-input') || iframeDoc.querySelector('textarea[placeholder*="Pergunte"]');
-			if (input) {
-				input.dispatchEvent(new iframeWin.KeyboardEvent('keydown', {key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true}));
-				return 'sent-enter';
-			}
-			return 'not-found';
+			input.dispatchEvent(new win.KeyboardEvent('keydown', {key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true}));
+			return 'sent-enter';
 		})()
 	`, nil))
 
@@ -515,11 +500,9 @@ func sendChatMessage(ctx context.Context, message string) error {
 // getAssistantMsgCount returns the current count of assistant messages in the chat.
 func getAssistantMsgCount(ctx context.Context) int {
 	var count int
-	chromedp.Run(ctx, chromedp.Evaluate(`
+	chromedp.Run(ctx, chromedp.Evaluate(deepQueryJS+`
 		(function() {
-			var doc = window.__getChatDoc();
-			if (!doc) return 0;
-			return doc.querySelectorAll('.message-item--assistant').length;
+			return window.__meliDeepQueryAll('.message-item--assistant').length;
 		})()
 	`, &count))
 	return count
@@ -541,11 +524,9 @@ func waitForResponse(ctx context.Context, initialCount int, timeout time.Duratio
 		if currentCount > initialCount {
 			// New message appeared — read its text
 			var currentText string
-			chromedp.Run(ctx, chromedp.Evaluate(`
+			chromedp.Run(ctx, chromedp.Evaluate(deepQueryJS+`
 				(function() {
-					var doc = window.__getChatDoc();
-					if (!doc) return '';
-					var msgs = doc.querySelectorAll('.message-item--assistant');
+					var msgs = window.__meliDeepQueryAll('.message-item--assistant');
 					if (msgs.length === 0) return '';
 					var last = msgs[msgs.length - 1];
 					var content = last.querySelector('.chat-message__content');
@@ -577,11 +558,9 @@ func waitForResponse(ctx context.Context, initialCount int, timeout time.Duratio
 // getLastAssistantMessage retrieves the text of the last assistant message.
 func getLastAssistantMessage(ctx context.Context) (string, error) {
 	var text string
-	err := chromedp.Run(ctx, chromedp.Evaluate(`
+	err := chromedp.Run(ctx, chromedp.Evaluate(deepQueryJS+`
 		(function() {
-			var doc = window.__getChatDoc();
-			if (!doc) return '';
-			var msgs = doc.querySelectorAll('.message-item--assistant');
+			var msgs = window.__meliDeepQueryAll('.message-item--assistant');
 			if (msgs.length === 0) return '';
 			var last = msgs[msgs.length - 1];
 			var content = last.querySelector('.chat-message__content');
@@ -654,7 +633,10 @@ func parseResponse(response string, originalNumbers []string) []claimResult {
 	if len(numberCategories) >= len(originalNumbers)/2 && len(numberCategories) > 0 {
 		// per-number format detected
 	} else {
-		// --- Strategy 2: Section-based format ---
+		// --- Strategy 2: Section/list-based format ---
+		// The assistant groups numbers under labels like "Excluída:",
+		// "Não excluídas:", "Pedidos sem exclusão:", "sem impacto".
+		// Each number takes the category of the nearest preceding marker.
 		numberCategories = make(map[string]string) // reset
 
 		type sectionMarker struct {
@@ -663,35 +645,27 @@ func parseResponse(response string, originalNumbers []string) []claimResult {
 		}
 		var markers []sectionMarker
 
-		sectionKeywords := map[string]string{
-			"sem impacto agora":    "no_impact",
-			"sem impacto na":       "no_impact",
-			"não afetam":           "no_impact",
-			"não impactam":         "no_impact",
+		// Unambiguous phrase markers.
+		phraseKeywords := map[string]string{
+			"sem impacto":          "no_impact",
 			"não afeta":            "no_impact",
+			"não afetam":           "no_impact",
+			"não impacta":          "no_impact",
+			"não impactam":         "no_impact",
 			"continua impactando":  "impacting",
 			"continuam impactando": "impacting",
-			"seguem impactando":    "impacting",
 			"segue impactando":     "impacting",
+			"seguem impactando":    "impacting",
+			"continua valendo":     "impacting",
+			"continuam valendo":    "impacting",
+			"sem exclusão":         "impacting",
+			"sem exclusao":         "impacting",
 			"não consegui":         "impacting",
 			"não foi possível":     "impacting",
-			"excluída agora":       "excluded",
-			"excluídas agora":      "excluded",
-			"excluído agora":       "excluded",
-			"excluídos agora":      "excluded",
-			"removida agora":       "excluded",
-			"removidas agora":      "excluded",
-			"removido agora":       "excluded",
-			"removidos agora":      "excluded",
-			"foram excluíd":        "excluded",
-			"foram removid":        "excluded",
-			"foi excluíd":          "excluded",
-			"foi removid":          "excluded",
-			"xcluída agora":        "excluded",
-			"xcluídas agora":       "excluded",
+			"não foi aprovada":     "impacting",
+			"não foram aprovadas":  "impacting",
 		}
-
-		for keyword, cat := range sectionKeywords {
+		for keyword, cat := range phraseKeywords {
 			idx := 0
 			for {
 				pos := strings.Index(responseLower[idx:], keyword)
@@ -700,6 +674,30 @@ func parseResponse(response string, originalNumbers []string) []claimResult {
 				}
 				markers = append(markers, sectionMarker{pos: idx + pos, category: cat})
 				idx += pos + len(keyword)
+			}
+		}
+
+		// "excluíd"/"removid" tokens mark exclusion, unless locally negated
+		// (e.g. "não excluídas", "sem exclusão") which means still impacting.
+		for _, token := range []string{"excluíd", "excluid", "removid"} {
+			idx := 0
+			for {
+				pos := strings.Index(responseLower[idx:], token)
+				if pos < 0 {
+					break
+				}
+				abs := idx + pos
+				start := abs - 8
+				if start < 0 {
+					start = 0
+				}
+				before := responseLower[start:abs]
+				if strings.Contains(before, "não ") || strings.Contains(before, "nao ") || strings.Contains(before, "sem ") {
+					markers = append(markers, sectionMarker{pos: abs, category: "impacting"})
+				} else {
+					markers = append(markers, sectionMarker{pos: abs, category: "excluded"})
+				}
+				idx = abs + len(token)
 			}
 		}
 
