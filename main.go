@@ -633,7 +633,10 @@ func parseResponse(response string, originalNumbers []string) []claimResult {
 	if len(numberCategories) >= len(originalNumbers)/2 && len(numberCategories) > 0 {
 		// per-number format detected
 	} else {
-		// --- Strategy 2: Section-based format ---
+		// --- Strategy 2: Section/list-based format ---
+		// The assistant groups numbers under labels like "Excluída:",
+		// "Não excluídas:", "Pedidos sem exclusão:", "sem impacto".
+		// Each number takes the category of the nearest preceding marker.
 		numberCategories = make(map[string]string) // reset
 
 		type sectionMarker struct {
@@ -642,35 +645,27 @@ func parseResponse(response string, originalNumbers []string) []claimResult {
 		}
 		var markers []sectionMarker
 
-		sectionKeywords := map[string]string{
-			"sem impacto agora":    "no_impact",
-			"sem impacto na":       "no_impact",
-			"não afetam":           "no_impact",
-			"não impactam":         "no_impact",
+		// Unambiguous phrase markers.
+		phraseKeywords := map[string]string{
+			"sem impacto":          "no_impact",
 			"não afeta":            "no_impact",
+			"não afetam":           "no_impact",
+			"não impacta":          "no_impact",
+			"não impactam":         "no_impact",
 			"continua impactando":  "impacting",
 			"continuam impactando": "impacting",
-			"seguem impactando":    "impacting",
 			"segue impactando":     "impacting",
+			"seguem impactando":    "impacting",
+			"continua valendo":     "impacting",
+			"continuam valendo":    "impacting",
+			"sem exclusão":         "impacting",
+			"sem exclusao":         "impacting",
 			"não consegui":         "impacting",
 			"não foi possível":     "impacting",
-			"excluída agora":       "excluded",
-			"excluídas agora":      "excluded",
-			"excluído agora":       "excluded",
-			"excluídos agora":      "excluded",
-			"removida agora":       "excluded",
-			"removidas agora":      "excluded",
-			"removido agora":       "excluded",
-			"removidos agora":      "excluded",
-			"foram excluíd":        "excluded",
-			"foram removid":        "excluded",
-			"foi excluíd":          "excluded",
-			"foi removid":          "excluded",
-			"xcluída agora":        "excluded",
-			"xcluídas agora":       "excluded",
+			"não foi aprovada":     "impacting",
+			"não foram aprovadas":  "impacting",
 		}
-
-		for keyword, cat := range sectionKeywords {
+		for keyword, cat := range phraseKeywords {
 			idx := 0
 			for {
 				pos := strings.Index(responseLower[idx:], keyword)
@@ -679,6 +674,30 @@ func parseResponse(response string, originalNumbers []string) []claimResult {
 				}
 				markers = append(markers, sectionMarker{pos: idx + pos, category: cat})
 				idx += pos + len(keyword)
+			}
+		}
+
+		// "excluíd"/"removid" tokens mark exclusion, unless locally negated
+		// (e.g. "não excluídas", "sem exclusão") which means still impacting.
+		for _, token := range []string{"excluíd", "excluid", "removid"} {
+			idx := 0
+			for {
+				pos := strings.Index(responseLower[idx:], token)
+				if pos < 0 {
+					break
+				}
+				abs := idx + pos
+				start := abs - 8
+				if start < 0 {
+					start = 0
+				}
+				before := responseLower[start:abs]
+				if strings.Contains(before, "não ") || strings.Contains(before, "nao ") || strings.Contains(before, "sem ") {
+					markers = append(markers, sectionMarker{pos: abs, category: "impacting"})
+				} else {
+					markers = append(markers, sectionMarker{pos: abs, category: "excluded"})
+				}
+				idx = abs + len(token)
 			}
 		}
 
