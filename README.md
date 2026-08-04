@@ -14,8 +14,24 @@ Aplicação em Go para solicitar a reanálise de reclamações no Mercado Livre 
 # Linux/Mac
 go build -o meli-reanalise-reclamacao .
 
-# Windows
-GOOS=windows GOARCH=amd64 go build -o meli-reanalise-reclamacao.exe .
+# Windows 64 bits (recomendado)
+GOOS=windows GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o ReanaliseReclamacaoML.exe .
+
+# Windows 32 bits (fallback para máquinas antigas)
+GOOS=windows GOARCH=386 go build -trimpath -ldflags="-s -w" -o ReanaliseReclamacaoML-32bits.exe .
+```
+
+### Metadados do executável Windows (publisher/versão + manifest)
+
+O build para Windows embute automaticamente metadados de versão/fabricante e um
+manifest de compatibilidade (`versioninfo.json` + `app.manifest`), o que reduz
+falsos positivos de SmartScreen/Defender ("Esse aplicativo não pode ser executado
+no seu PC"). Os arquivos `resource_windows_*.syso` são gerados a partir do
+`versioninfo.json`. Para regerá-los após editar os metadados:
+
+```bash
+go install github.com/josephspurrier/goversioninfo/cmd/goversioninfo@latest
+go generate ./...
 ```
 
 ## Usar

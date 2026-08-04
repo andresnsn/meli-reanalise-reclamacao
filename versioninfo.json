@@ -1,0 +1,40 @@
+{
+  "FixedFileInfo": {
+    "FileVersion": {
+      "Major": 1,
+      "Minor": 2,
+      "Patch": 0,
+      "Build": 0
+    },
+    "ProductVersion": {
+      "Major": 1,
+      "Minor": 2,
+      "Patch": 0,
+      "Build": 0
+    },
+    "FileFlagsMask": "3f",
+    "FileFlags": "00",
+    "FileOS": "040004",
+    "FileType": "01",
+    "FileSubType": "00"
+  },
+  "StringFileInfo": {
+    "CompanyName": "Grupo Casas Bahia - Automacoes Internas",
+    "FileDescription": "Reanalise de Reclamacoes ML - Ferramenta interna de atendimento",
+    "FileVersion": "1.2.0.0",
+    "InternalName": "ReanaliseReclamacaoML",
+    "LegalCopyright": "Copyright 2026. Uso interno autorizado.",
+    "OriginalFilename": "ReanaliseReclamacaoML.exe",
+    "ProductName": "Reanalise de Reclamacoes ML",
+    "ProductVersion": "1.2.0.0",
+    "Comments": "Ferramenta de apoio ao atendimento para reanalise de reclamacoes no Mercado Livre."
+  },
+  "VarFileInfo": {
+    "Translation": {
+      "LangID": "0416",
+      "CharsetID": "04B0"
+    }
+  },
+  "IconPath": "",
+  "ManifestPath": "app.manifest"
+}
