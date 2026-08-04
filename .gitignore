@@ -2,4 +2,6 @@ meli-reanalise-reclamacao
 meli-reanalise-reclamacao.exe
 ReanaliseReclamacaoML.exe
 ReanaliseReclamacaoML-32bits.exe
+ReanaliseReclamacaoML-arm64.exe
+*.exe
 *.xlsx
